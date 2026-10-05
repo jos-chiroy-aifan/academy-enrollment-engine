@@ -147,3 +147,14 @@ vite.config.ts.timestamp-*
 
 # Turbo Repo
 .turbo
+
+# Clasp - Credenciales y tokens de acceso (NUNCA SUBIR)
+.clasprc.json
+.clasp.json
+
+# Variables locales / Entorno
+.env
+config.local.js
+
+# IDE (JetBrains)
+.idea/
