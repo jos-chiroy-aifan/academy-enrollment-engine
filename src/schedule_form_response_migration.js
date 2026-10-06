@@ -4,9 +4,27 @@
  * 2. Valida capacidad de salones físicos (máximo 6 simultáneos).
  * 3. Asigna Profesor sin doble descuento y Horario.
  * 4. Crea la inscripción con Costos y Nombres Completos (Mapeo A-Q exacto).
+ *
+ * LOGS: cada línea lleva [MIGRACIÓN #id fila=N]. Busca "RESULTADO" en el panel
+ * de Ejecuciones para ver cómo terminó cada corrida (OK / OMITIDO / FALLO).
  ****************************************************************************/
 
-function processUnifiedMainMigration() {
+function processUnifiedMainMigration(e) {
+  const log = createRunLogger_("MIGRACIÓN");
+  log.info(`Inicio | disparador: ${describeTrigger_(e)}`);
+
+  let outcome;
+  try {
+    outcome = runUnifiedMainMigration_(e, log);
+  } catch (err) {
+    log.error("Excepción no controlada. El proceso se detuvo: revisa cuál fue el último PASO registrado arriba.", err);
+    log.result("FALLO", `Excepción: ${err && err.message ? err.message : err}`);
+    throw err;
+  }
+  log.result(outcome.result, outcome.detail);
+}
+
+function runUnifiedMainMigration_(e, log) {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
 
   // --- HOJAS REQUERIDAS ---
@@ -19,14 +37,25 @@ function processUnifiedMainMigration() {
   const paSheet = ss.getSheetByName("Professor_Availability");
 
   if (!rSheet || !sSheet || !eSheet || !progSheet || !profSheet || !ppSheet || !paSheet) {
-    throw new Error("Faltan hojas requeridas en la base de datos.");
+    const missing = [
+      ["Student Registration - Responses", rSheet], ["Students", sSheet], ["Student_Enrollments", eSheet],
+      ["Programs", progSheet], ["Professors", profSheet], ["Professor_Programs", ppSheet], ["Professor_Availability", paSheet]
+    ].filter(([, sh]) => !sh).map(([n]) => n);
+    throw new Error(`Faltan hojas requeridas en la base de datos: ${missing.join(", ")}`);
   }
 
   const lastRow = rSheet.getLastRow();
   const lastCol = rSheet.getLastColumn();
   if (lastRow < 2) {
-    Logger.log("⚠️ No hay filas de datos suficientes en 'Student Registration - Responses'.");
-    return;
+    log.warn("No hay filas de datos suficientes en 'Student Registration - Responses'.");
+    return { result: "OMITIDO", detail: "Sin filas de datos" };
+  }
+  log.set("fila", lastRow);
+
+  // El script siempre procesa la ÚLTIMA fila. Si el evento trae otra fila, se avisa.
+  const triggerRow = e && e.range ? e.range.getRow() : null;
+  if (triggerRow && triggerRow !== lastRow) {
+    log.warn(`El formulario envió la fila ${triggerRow}, pero este script procesa la última fila (${lastRow}). Si llegaron dos respuestas casi al mismo tiempo, la fila ${triggerRow} puede quedar sin procesar.`);
   }
 
   // --- MAPEO DE COLUMNAS (Para leer la respuesta sin fallos por espacios) ---
@@ -54,38 +83,53 @@ function processUnifiedMainMigration() {
   const lastName = String(rowValues[I.lastName] || "").trim();
   const currentStatus = String(rowValues[I.status] || "").trim();
 
-  Logger.log(`ℹ️ Procesando última fila (${lastRow}) | Alumno: "${firstName} ${lastName}" | Correo: "${email}" | Estatus actual: "${currentStatus}"`);
+  log.info(`Alumno: "${firstName} ${lastName}" | Correo: "${email}" | Estatus al iniciar: "${currentStatus || "(vacío)"}"`);
+
+  // Escribe el estatus y deja rastro de la transición. Si otra ejecución ya dejó
+  // la fila en "Migrated", lo avisa: es la señal de una ejecución duplicada.
+  const setStatus = (newStatus) => {
+    const cell = rSheet.getRange(lastRow, I.status + 1);
+    const before = String(cell.getValue() || "").trim();
+    if (before === "Migrated") {
+      log.warn(`CARRERA DETECTADA: la fila ya estaba "Migrated" (otra ejecución la terminó mientras esta corría). Esta ejecución la sobrescribe con "${newStatus}".`);
+    }
+    cell.setValue(newStatus);
+    log.info(`Estatus: "${before || "(vacío)"}" → "${newStatus}"`);
+  };
 
   // Si ya está terminado, salir
   if (currentStatus === "Migrated") {
-    Logger.log(`ℹ️ La fila ${lastRow} ya se encuentra como 'Migrated'. No hay nada que procesar.`);
-    return;
+    log.info(`La fila ${lastRow} ya se encuentra como 'Migrated'. No hay nada que procesar.`);
+    return { result: "OMITIDO", detail: "La fila ya estaba Migrated" };
   }
 
   // =================================================================
   // PASO 1: OBTENER ESTUDIANTE (Llamando al Script 1 o Llave Compuesta)
   // =================================================================
+  log.info("PASO 1: obtener o crear estudiante...");
   let studentData = null;
 
   // Intentamos crear el estudiante
   // Si devuelve objeto, es nuevo. Si devuelve null/undefined, es que ya estaba "Approved".
-  studentData = processStudentCreationOnly();
+  studentData = processStudentCreationOnly(log);
 
   // Si processStudentCreationOnly no devolvió nada (porque ya estaba Approved),
   // buscamos al estudiante por LLAVE COMPUESTA (Email + Nombre + Apellido) para no pisar hermanos.
   if (!studentData) {
+    log.info("PASO 1: la fila ya estaba Approved; buscando al alumno en 'Students' por correo + nombre + apellido...");
     studentData = findStudentByEmailAndName_(sSheet, email, firstName, lastName);
 
     if (!studentData) {
-      Logger.log(`❌ ERROR PASO 1: Estudiante "${firstName} ${lastName}" (${email}) figuraba como Approved pero no se encontró en la hoja 'Students'.`);
-      rSheet.getRange(lastRow, I.status + 1).setValue("Error: Student Approved but Not Found");
-      return;
+      log.error(`PASO 1: Estudiante "${firstName} ${lastName}" (${email}) figuraba como Approved pero no se encontró en la hoja 'Students'.`);
+      setStatus("Error: Student Approved but Not Found");
+      return { result: "FALLO", detail: "PASO 1 | Error: Student Approved but Not Found" };
     }
   }
 
   const studentId = studentData.id;
   const studentFullName = studentData.fullName;
-  Logger.log(`✅ PASO 1 Exitoso: Estudiante listo -> ID: ${studentId} | Nombre: ${studentFullName}`);
+  log.set("alumno", studentId);
+  log.info(`✅ PASO 1: estudiante listo -> ID: ${studentId} | Nombre: ${studentFullName}`);
 
   // =================================================================
   // PASO 2: PREPARAR DATOS DE PROGRAMA Y HORARIO
@@ -96,9 +140,9 @@ function processUnifiedMainMigration() {
   const programInfo = getProgramInfoExtended_(progSheet, programName);
 
   if (programInfo.id === "UNKNOWN") {
-    Logger.log(`❌ ERROR PASO 2: Programa no encontrado en catálogo -> "${programName}". Verifique tildes o espacios exactos en 'Programs'.`);
-    rSheet.getRange(lastRow, I.status + 1).setValue("Pending Program Error");
-    return;
+    log.error(`PASO 2: Programa no encontrado en catálogo -> "${programName}". Verifique tildes o espacios exactos en 'Programs'.`);
+    setStatus("Pending Program Error");
+    return { result: "FALLO", detail: `PASO 2 | Pending Program Error | programa "${programName}"` };
   }
 
   // Detectar Horario en columnas Q-Z (idx 16 a 25)
@@ -106,15 +150,16 @@ function processUnifiedMainMigration() {
   const parsed = parseSchedule_(scheduleRaw);
 
   if (!parsed) {
-    Logger.log(`❌ ERROR PASO 2: No se pudo parsear el horario. Texto leído en celda: "${scheduleRaw}"`);
-    rSheet.getRange(lastRow, I.status + 1).setValue("Pending Schedule Error");
-    return;
+    log.error(`PASO 2: No se pudo parsear el horario. Texto leído en celda: "${scheduleRaw}"`);
+    setStatus("Pending Schedule Error");
+    return { result: "FALLO", detail: `PASO 2 | Pending Schedule Error | horario "${scheduleRaw}"` };
   }
 
   const dayKey = parsed.dayOfWeek;
   const timeSlot = parsed.timeSlot;
   const periods = 1; // Por defecto 1 periodo
-  Logger.log(`✅ PASO 2 Exitoso: Programa ID: ${programInfo.id} | Día normalizado: ${dayKey} | Horario: ${timeSlot}`);
+  log.info(`✅ PASO 2: Programa "${programName}" (${programInfo.id}, Q${programInfo.price}) | Horario leído: "${scheduleRaw}" → día ${dayKey} | bloque ${timeSlot}`);
+  if (!dayKey) log.warn(`PASO 2: no se reconoció el día en "${scheduleRaw}" (quedó vacío). La búsqueda de profesores fallará.`);
 
   // =================================================================
   // PASO 3: LÓGICA DE ASIGNACIÓN
@@ -132,15 +177,25 @@ function processUnifiedMainMigration() {
   };
 
   const usage = buildActiveEnrollmentUsage_(eSheet, nextTimeSlotFn);
+  log.info(`PASO 3: profesores activos: ${professorsActive.size} | profesores con el programa ${programInfo.id}: ${professorPrograms[programInfo.id] ? professorPrograms[programInfo.id].size : 0}`);
+
+  // Diagnóstico de duplicados: ¿este alumno ya tiene esta misma inscripción activa?
+  const studentEnrollments = findActiveEnrollmentsForStudent_(eSheet, studentId);
+  log.info(`PASO 3: inscripciones activas previas del alumno: ${studentEnrollments.length ? studentEnrollments.map(formatEnrollment_).join(" ; ") : "ninguna"}`);
+  const duplicate = studentEnrollments.find(x => x.programId === programInfo.id && x.dayKey === dayKey && x.timeSlot === timeSlot);
+  if (duplicate) {
+    log.warn(`DUPLICADO: el alumno YA tiene una inscripción activa idéntica (${duplicate.enrollmentId}). Esta ejecución probablemente repite una anterior; si a continuación se marca "Pending Capacity Full", es un FALSO POSITIVO (el profesor aparece ocupado por la propia inscripción del alumno).`);
+  }
 
   // VALIDACIÓN DE SALONES FÍSICOS (MÁXIMO: Script Property MAX_PHYSICAL_ROOMS, por defecto 6)
   const maxPhysicalRooms = Number(PropertiesService.getScriptProperties().getProperty("MAX_PHYSICAL_ROOMS")) || 6;
   const roomUsageKey = `${dayKey}|${timeSlot}`;
   const occupiedRooms = usage.roomsBySlot?.[roomUsageKey] || 0;
+  log.info(`PASO 3: salones ocupados en ${roomUsageKey}: ${occupiedRooms}/${maxPhysicalRooms}`);
   if (occupiedRooms >= maxPhysicalRooms) {
-    Logger.log(`❌ ERROR PASO 3 (Salones Llenos): En el bloque ${roomUsageKey} ya hay ${occupiedRooms}/${maxPhysicalRooms} salones ocupados.`);
-    rSheet.getRange(lastRow, I.status + 1).setValue("Pending Capacity Full");
-    return;
+    log.error(`PASO 3 (Salones Llenos): En el bloque ${roomUsageKey} ya hay ${occupiedRooms}/${maxPhysicalRooms} salones ocupados. Ocupan el bloque: ${listEnrollmentsAtSlot_(eSheet, dayKey, timeSlot).map(formatEnrollment_).join(" ; ")}`);
+    setStatus("Pending Capacity Full");
+    return { result: "FALLO", detail: `PASO 3 | Pending Capacity Full | motivo: salones llenos (${occupiedRooms}/${maxPhysicalRooms}) en ${roomUsageKey}` };
   }
 
   // Buscar Candidatos Libres
@@ -155,10 +210,20 @@ function processUnifiedMainMigration() {
     usage: usage,
   });
 
+  logCandidateDiagnosis_(log, {
+    programId: programInfo.id,
+    dayKey: dayKey,
+    timeSlot: timeSlot,
+    professorPrograms: professorPrograms,
+    availability: availability,
+    usage: usage,
+  });
+
   if (candidates.length === 0) {
-    Logger.log(`❌ ERROR PASO 3 (Sin Profesores): No hay profesores activos disponibles para el programa "${programName}" (${programInfo.id}) en ${roomUsageKey}.`);
-    rSheet.getRange(lastRow, I.status + 1).setValue("Pending Capacity Full");
-    return;
+    const occupants = listEnrollmentsAtSlot_(eSheet, dayKey, timeSlot);
+    log.error(`PASO 3 (Sin Profesores): No hay profesores activos disponibles para el programa "${programName}" (${programInfo.id}) en ${roomUsageKey}. Clases activas en ese bloque: ${occupants.length ? occupants.map(formatEnrollment_).join(" ; ") : "ninguna"}`);
+    setStatus("Pending Capacity Full");
+    return { result: "FALLO", detail: `PASO 3 | Pending Capacity Full | motivo: ningún profesor libre${duplicate ? " (FALSO POSITIVO probable: inscripción duplicada " + duplicate.enrollmentId + ")" : ""}` };
   }
 
   // Prioridad
@@ -173,7 +238,7 @@ function processUnifiedMainMigration() {
 
   // Obtener Nombre del Profesor
   const professorFullName = getProfessorFullName_(profSheet, assignedProfessorId);
-  Logger.log(`✅ PASO 3 Exitoso: Profesor asignado -> ${assignedProfessorId} (${professorFullName})`);
+  log.info(`✅ PASO 3: Profesor asignado -> ${assignedProfessorId} (${professorFullName}) | regla: ${assignedProfessorId === priorityProfId ? "prioridad" : `aleatorio entre ${candidates.length} candidato(s)`}`);
 
   // =================================================================
   // PASO 4: CREAR INSCRIPCIÓN (Enrollment)
@@ -206,8 +271,12 @@ function processUnifiedMainMigration() {
   ];
 
   const eTargetRow = getFirstRealEmptyRowMain_(eSheet, "A");
+  // Solo se avisa si la fila destino tiene datos reales (B StudentID, D ProgramID, F Day, G Slot, I Prof)
+  if (eTargetRow <= eSheet.getLastRow() && rowHasData_(eSheet, eTargetRow, [2, 4, 6, 7, 9])) {
+    log.warn(`PASO 4: la fila ${eTargetRow} de 'Student_Enrollments' no tiene EnrollmentID (columna A) pero SÍ tiene datos. Se sobrescribirá. Revisa si era una inscripción capturada a mano sin ID.`);
+  }
   eSheet.getRange(eTargetRow, 1, 1, newEnrollmentRow.length).setValues([newEnrollmentRow]);
-  Logger.log(`✅ PASO 4 Exitoso: Inscripción creada en 'Student_Enrollments' fila ${eTargetRow} con ID ${enrollmentId}`);
+  log.info(`✅ PASO 4: Inscripción creada en 'Student_Enrollments' fila ${eTargetRow} con ID ${enrollmentId}`);
 
   // Actualizar uso en memoria
   incUsage_(usage, programInfo.id, dayKey, timeSlot, assignedProfessorId);
@@ -217,13 +286,13 @@ function processUnifiedMainMigration() {
   // =================================================================
 
   // Marcamos como "Migrated" en la columna AB (idx 27)
-  rSheet.getRange(lastRow, I.status + 1).setValue("Migrated");
-  Logger.log(`🎉 Proceso completado exitosamente para la fila ${lastRow}. Estatus marcado como 'Migrated'.`);
+  setStatus("Migrated");
 
   // Notificaciones
+  log.info(`PASO 5: enviando correos | cuota de correos restante hoy: ${MailApp.getRemainingDailyQuota()}`);
   try {
     if (typeof notifyProfessorNewStudent_ === 'function') {
-      notifyProfessorNewStudent_({
+      const sentTo = notifyProfessorNewStudent_({
         professorId: assignedProfessorId,
         studentId: studentId,
         programId: programInfo.id,
@@ -231,8 +300,12 @@ function processUnifiedMainMigration() {
         timeSlot: timeSlot,
         periods: periods
       });
+      if (sentTo) log.info(`PASO 5: correo entregado a Gmail para el profesor ${assignedProfessorId} (${sentTo}).`);
+      else log.warn(`PASO 5: NO se envió correo al profesor ${assignedProfessorId}: no tiene correo o no está Active en 'Professors'.`);
+    } else {
+      log.warn("PASO 5: no existe notifyProfessorNewStudent_; no se notificó al profesor.");
     }
-  } catch (err) { Logger.log("Error correo profe: " + err); }
+  } catch (err) { log.error("PASO 5: Error enviando correo al profesor", err); }
 
   try {
     if (typeof sendScheduleConfirmationEmail_ === 'function') {
@@ -248,8 +321,84 @@ function processUnifiedMainMigration() {
         professorName: professorFullName,
         notes: ""
       });
+      log.info(`PASO 5: correo de confirmación entregado a Gmail para el alumno (${email}).`);
+    } else {
+      log.warn("PASO 5: no existe sendScheduleConfirmationEmail_; no se notificó al alumno.");
     }
-  } catch (err) { Logger.log("Error correo alumno: " + err); }
+  } catch (err) { log.error("PASO 5: Error enviando correo al alumno", err); }
+
+  return { result: "OK", detail: `${enrollmentId} | ${studentId} | ${programName} | ${dayKey} ${timeSlot} | prof ${assignedProfessorId}` };
+}
+
+
+/**
+ * -------------------------------------------------------------------------
+ * FUNCIONES DE DIAGNÓSTICO (solo leen y registran; no cambian datos)
+ * -------------------------------------------------------------------------
+ */
+
+function describeTrigger_(e) {
+  if (!e) return "manual (sin evento)";
+  const row = e.range ? e.range.getRow() : "-";
+  return `evento de formulario | triggerUid=${e.triggerUid || "-"} | fila enviada=${row}`;
+}
+
+// Resume una fila de Student_Enrollments (A=0 ID, B=1 Student, D=3 ProgramID, E=4 Program, F=5 Day, G=6 Slot, I=8 Prof)
+function enrollmentSummary_(r) {
+  return {
+    enrollmentId: String(r[0]).trim(),
+    studentId: String(r[1]).trim(),
+    programId: String(r[3]).trim(),
+    program: String(r[4]).trim(),
+    dayKey: normalizeDayKey_(r[5]),
+    timeSlot: normalizeTimeSlot_(r[6]),
+    profId: String(r[8]).trim()
+  };
+}
+
+function formatEnrollment_(x) {
+  return `${x.enrollmentId || "(sin ID)"} [${x.studentId}, ${x.program || x.programId}, ${x.dayKey} ${x.timeSlot}, prof ${x.profId || "-"}]`;
+}
+
+function readActiveEnrollmentSummaries_(sheet) {
+  const last = sheet.getLastRow();
+  if (last < 2) return [];
+  const vals = sheet.getRange(2, 1, last - 1, sheet.getLastColumn()).getValues();
+  return vals.filter(r => String(r[10]).trim() === "Active").map(enrollmentSummary_); // Col K: State
+}
+
+function findActiveEnrollmentsForStudent_(sheet, studentId) {
+  return readActiveEnrollmentSummaries_(sheet).filter(x => x.studentId === String(studentId).trim());
+}
+
+function listEnrollmentsAtSlot_(sheet, dayKey, timeSlot) {
+  return readActiveEnrollmentSummaries_(sheet).filter(x => x.dayKey === dayKey && x.timeSlot === timeSlot);
+}
+
+// Explica, profesor por profesor, por qué es o no es candidato
+function logCandidateDiagnosis_(log, opts) {
+  const { programId, dayKey, timeSlot, professorPrograms, availability, usage } = opts;
+  const profs = professorPrograms[programId];
+  if (!profs || profs.size === 0) {
+    log.warn(`PASO 3: ningún profesor ACTIVO tiene el programa ${programId} en estado Active en 'Professor_Programs'.`);
+    return;
+  }
+
+  const slotKey = `${dayKey}|${timeSlot}`;
+  const lines = [];
+  for (const pId of profs) {
+    const daySlots = availability[pId]?.[dayKey];
+    const isAvail = !!daySlots?.has(timeSlot);
+    const isBusy = !!usage.busyProfs?.has(`${pId}|${slotKey}`);
+    let reason = "CANDIDATO";
+    if (!isAvail) {
+      reason = `descartado: no tiene disponibilidad activa en ${slotKey} (bloques activos ese día: ${daySlots && daySlots.size ? [...daySlots].join(", ") : "ninguno"})`;
+    } else if (isBusy) {
+      reason = "descartado: ya tiene una clase activa en ese bloque";
+    }
+    lines.push(`   · ${pId} → ${reason}`);
+  }
+  log.info(`PASO 3: evaluación de profesores para ${programId} en ${slotKey}:\n${lines.join("\n")}`);
 }
 
 

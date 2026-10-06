@@ -88,6 +88,21 @@ function retryAllApprovedStudents() {
  * NÚCLEO DEL REINTENTO PARA UNA FILA INDIVIDUAL
  */
 function processSingleStudentRowRetry_(rowNumber) {
+  const log = createRunLogger_("REINTENTO");
+  log.set("fila", rowNumber);
+
+  let outcome;
+  try {
+    outcome = runSingleStudentRowRetry_(rowNumber, log);
+  } catch (err) {
+    log.error("Excepción no controlada. El reintento se detuvo: revisa cuál fue el último PASO registrado arriba.", err);
+    log.result("FALLO", `Excepción: ${err && err.message ? err.message : err}`);
+    throw err;
+  }
+  log.result(outcome.result, outcome.detail);
+}
+
+function runSingleStudentRowRetry_(rowNumber, log) {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
 
   const rSheet = ss.getSheetByName("Student Registration - Responses");
@@ -125,7 +140,8 @@ function processSingleStudentRowRetry_(rowNumber) {
   const lastName = String(rowValues[I.lastName] || "").trim();
   const programName = String(rowValues[I.programName] || "").trim();
 
-  Logger.log(`📋 [Fila ${rowNumber}] Alumno: "${firstName} ${lastName}" | Correo: ${email} | Programa: ${programName}`);
+  const currentStatus = String(rowValues[I.status] || "").trim();
+  log.info(`Alumno: "${firstName} ${lastName}" | Correo: ${email} | Programa: ${programName} | Estatus al iniciar: "${currentStatus || "(vacío)"}"`);
 
   // -------------------------------------------------------------
   // PASO 1: OBTENER O RE-CREAR ESTUDIANTE (LLAVE COMPUESTA)
@@ -133,40 +149,55 @@ function processSingleStudentRowRetry_(rowNumber) {
   let studentData = findStudentByEmailAndName_(sSheet, email, firstName, lastName);
 
   if (!studentData) {
-    Logger.log(`ℹ️ [Fila ${rowNumber}] El alumno no existe en 'Students' (posiblemente borrado). Creándolo nuevamente...`);
+    log.info("PASO 1: el alumno no existe en 'Students' (posiblemente borrado). Creándolo nuevamente...");
     studentData = createStudentFromRowData_(sSheet, rowValues);
     if (!studentData) {
-      Logger.log(`❌ [Fila ${rowNumber}] Falló la recreación del estudiante.`);
+      log.error("PASO 1: falló la recreación del estudiante.");
       rSheet.getRange(rowNumber, I.status + 1).setValue("Error: Cannot Recreate Student");
-      return;
+      return { result: "FALLO", detail: "PASO 1 | Error: Cannot Recreate Student" };
     }
-    Logger.log(`✅ [Fila ${rowNumber}] Alumno recreado con éxito: ID ${studentData.id} (${studentData.fullName})`);
+    log.info(`✅ PASO 1: alumno recreado con éxito: ID ${studentData.id} (${studentData.fullName})`);
   } else {
-    Logger.log(`✅ [Fila ${rowNumber}] Alumno encontrado en base de datos: ID ${studentData.id} (${studentData.fullName})`);
+    log.info(`✅ PASO 1: alumno encontrado en base de datos: ID ${studentData.id} (${studentData.fullName})`);
   }
+  log.set("alumno", studentData.id);
 
   // -------------------------------------------------------------
   // PASO 2: VALIDAR PROGRAMA Y PARSEAR HORARIO
   // -------------------------------------------------------------
   const programInfo = getProgramInfoExtended_(progSheet, programName);
   if (programInfo.id === "UNKNOWN") {
-    Logger.log(`❌ [Fila ${rowNumber}] RECHAZADO: Programa "${programName}" no existe en la hoja 'Programs'. Revisa tildes.`);
+    log.error(`PASO 2: programa "${programName}" no existe en la hoja 'Programs'. Revisa tildes.`);
     rSheet.getRange(rowNumber, I.status + 1).setValue("Pending Program Error");
-    return;
+    return { result: "FALLO", detail: `PASO 2 | Pending Program Error | programa "${programName}"` };
   }
 
   const scheduleRaw = pickScheduleValueByProgram_(rowValues, headers, programName);
   const parsed = parseSchedule_(scheduleRaw);
   if (!parsed || !parsed.dayOfWeek || !parsed.timeSlot) {
-    Logger.log(`❌ [Fila ${rowNumber}] RECHAZADO: Formato de horario inválido. Texto leído: "${scheduleRaw}"`);
+    log.error(`PASO 2: formato de horario inválido. Texto leído: "${scheduleRaw}"`);
     rSheet.getRange(rowNumber, I.status + 1).setValue("Pending Schedule Error");
-    return;
+    return { result: "FALLO", detail: `PASO 2 | Pending Schedule Error | horario "${scheduleRaw}"` };
   }
 
   const dayKey = parsed.dayOfWeek;
   const timeSlot = parsed.timeSlot;
   const periods = 1;
-  Logger.log(`🔎 [Fila ${rowNumber}] Horario solicitado: ${dayKey} - ${timeSlot}`);
+  log.info(`✅ PASO 2: programa "${programName}" (${programInfo.id}) | horario leído: "${scheduleRaw}" → ${dayKey} ${timeSlot}`);
+
+  // -------------------------------------------------------------
+  // GUARDIA: ¿el alumno YA tiene esta misma inscripción activa?
+  // Sin esto, el profesor aparece ocupado por la propia clase del
+  // alumno y el reintento marca un falso "Pending Capacity Full".
+  // -------------------------------------------------------------
+  const studentEnrollments = findActiveEnrollmentsForStudent_(eSheet, studentData.id);
+  log.info(`Inscripciones activas previas del alumno: ${studentEnrollments.length ? studentEnrollments.map(formatEnrollment_).join(" ; ") : "ninguna"}`);
+  const existingEnrollment = studentEnrollments.find(x => x.programId === programInfo.id && x.dayKey === dayKey && x.timeSlot === timeSlot);
+  if (existingEnrollment) {
+    log.warn(`El alumno YA está inscrito en este programa y horario (${existingEnrollment.enrollmentId}). No se crea otra inscripción ni se envían correos. Estatus: "${currentStatus || "(vacío)"}" → "Migrated"`);
+    rSheet.getRange(rowNumber, I.status + 1).setValue("Migrated");
+    return { result: "OMITIDO", detail: `Ya inscrito: ${existingEnrollment.enrollmentId}. Fila marcada Migrated sin crear nada` };
+  }
 
   // -------------------------------------------------------------
   // PASO 3: VALIDACIÓN DE CAPACIDAD FÍSICA (SALONES)
@@ -185,12 +216,12 @@ function processSingleStudentRowRetry_(rowNumber) {
   const slotKey = `${dayKey}|${timeSlot}`;
   const occupiedRooms = usage.roomsBySlot?.[slotKey] || 0;
 
-  Logger.log(`🏢 [Fila ${rowNumber}] Ocupación en ${slotKey}: ${occupiedRooms}/${RETRY_CONFIG.MAX_ROOMS} salones ocupados.`);
+  log.info(`PASO 3: salones ocupados en ${slotKey}: ${occupiedRooms}/${RETRY_CONFIG.MAX_ROOMS}`);
 
   if (occupiedRooms >= RETRY_CONFIG.MAX_ROOMS) {
-    Logger.log(`❌ [Fila ${rowNumber}] RECHAZADO POR SALONES LLENOS: Ya alcanzaron el límite de ${RETRY_CONFIG.MAX_ROOMS} en ese horario.`);
+    log.error(`PASO 3 (Salones Llenos): ya se alcanzó el límite de ${RETRY_CONFIG.MAX_ROOMS} en ${slotKey}. Ocupan el bloque: ${listEnrollmentsAtSlot_(eSheet, dayKey, timeSlot).map(formatEnrollment_).join(" ; ")}`);
     rSheet.getRange(rowNumber, I.status + 1).setValue("Pending Capacity Full");
-    return;
+    return { result: "FALLO", detail: `PASO 3 | Pending Capacity Full | motivo: salones llenos (${occupiedRooms}/${RETRY_CONFIG.MAX_ROOMS}) en ${slotKey}` };
   }
 
   // -------------------------------------------------------------
@@ -207,13 +238,15 @@ function processSingleStudentRowRetry_(rowNumber) {
     usage: usage,
   });
 
+  logCandidateDiagnosis_(log, { programId: programInfo.id, dayKey, timeSlot, professorPrograms, availability, usage });
+
   if (candidates.length === 0) {
-    Logger.log(`❌ [Fila ${rowNumber}] RECHAZADO POR PROFESORES: Ningún profesor activo para "${programName}" tiene libre el bloque ${slotKey}.`);
+    const occupants = listEnrollmentsAtSlot_(eSheet, dayKey, timeSlot);
+    log.error(`PASO 4 (Sin Profesores): ningún profesor activo para "${programName}" tiene libre el bloque ${slotKey}. Clases activas en ese bloque: ${occupants.length ? occupants.map(formatEnrollment_).join(" ; ") : "ninguna"}`);
     rSheet.getRange(rowNumber, I.status + 1).setValue("Pending Capacity Full");
-    return;
+    return { result: "FALLO", detail: "PASO 4 | Pending Capacity Full | motivo: ningún profesor libre" };
   }
 
-  Logger.log(`👨‍🏫 [Fila ${rowNumber}] Profesores candidatos disponibles: ${JSON.stringify(candidates)}`);
 
   let assignedProfessorId;
   if (candidates.includes(RETRY_CONFIG.PRIORITY_PROF_ID)) {
@@ -223,7 +256,7 @@ function processSingleStudentRowRetry_(rowNumber) {
   }
 
   const professorFullName = getProfessorFullName_(profSheet, assignedProfessorId);
-  Logger.log(`🎯 [Fila ${rowNumber}] Profesor asignado: ${assignedProfessorId} (${professorFullName})`);
+  log.info(`✅ PASO 4: profesor asignado -> ${assignedProfessorId} (${professorFullName}) | regla: ${assignedProfessorId === RETRY_CONFIG.PRIORITY_PROF_ID ? "prioridad" : `aleatorio entre ${candidates.length} candidato(s)`}`);
 
   // -------------------------------------------------------------
   // PASO 5: CREAR INSCRIPCIÓN (ENROLLMENT)
@@ -257,18 +290,19 @@ function processSingleStudentRowRetry_(rowNumber) {
 
   const eTargetRow = getFirstRealEmptyRowMain_(eSheet, "A");
   eSheet.getRange(eTargetRow, 1, 1, newEnrollmentRow.length).setValues([newEnrollmentRow]);
-  Logger.log(`📝 [Fila ${rowNumber}] Inscripción registrada en 'Student_Enrollments' fila ${eTargetRow} con ID ${enrollmentId}`);
+  log.info(`✅ PASO 5: inscripción registrada en 'Student_Enrollments' fila ${eTargetRow} con ID ${enrollmentId}`);
 
   // Marcar como Migrated en la columna AB (idx 27)
   rSheet.getRange(rowNumber, I.status + 1).setValue("Migrated");
-  Logger.log(`🎉 [Fila ${rowNumber}] ¡REINTENTO EXITOSO! Estatus actualizado a 'Migrated'.`);
+  log.info(`Estatus: "${currentStatus || "(vacío)"}" → "Migrated"`);
 
   // -------------------------------------------------------------
   // PASO 6: ENVÍO DE NOTIFICACIONES
   // -------------------------------------------------------------
+  log.info(`PASO 6: enviando correos | cuota de correos restante hoy: ${MailApp.getRemainingDailyQuota()}`);
   try {
     if (typeof notifyProfessorNewStudent_ === 'function') {
-      notifyProfessorNewStudent_({
+      const sentTo = notifyProfessorNewStudent_({
         professorId: assignedProfessorId,
         studentId: studentData.id,
         programId: programInfo.id,
@@ -276,8 +310,12 @@ function processSingleStudentRowRetry_(rowNumber) {
         timeSlot: timeSlot,
         periods: periods
       });
+      if (sentTo) log.info(`PASO 6: correo entregado a Gmail para el profesor ${assignedProfessorId} (${sentTo}).`);
+      else log.warn(`PASO 6: NO se envió correo al profesor ${assignedProfessorId}: no tiene correo o no está Active en 'Professors'.`);
+    } else {
+      log.warn("PASO 6: no existe notifyProfessorNewStudent_; no se notificó al profesor.");
     }
-  } catch (err) { Logger.log("Error correo profe: " + err); }
+  } catch (err) { log.error("PASO 6: error enviando correo al profesor", err); }
 
   try {
     if (typeof sendScheduleConfirmationEmail_ === 'function') {
@@ -293,8 +331,13 @@ function processSingleStudentRowRetry_(rowNumber) {
         professorName: professorFullName,
         notes: ""
       });
+      log.info(`PASO 6: correo de confirmación entregado a Gmail para el alumno (${email}).`);
+    } else {
+      log.warn("PASO 6: no existe sendScheduleConfirmationEmail_; no se notificó al alumno.");
     }
-  } catch (err) { Logger.log("Error correo alumno: " + err); }
+  } catch (err) { log.error("PASO 6: error enviando correo al alumno", err); }
+
+  return { result: "OK", detail: `${enrollmentId} | ${studentData.id} | ${programName} | ${dayKey} ${timeSlot} | prof ${assignedProfessorId}` };
 }
 
 /**

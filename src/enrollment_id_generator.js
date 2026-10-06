@@ -5,9 +5,12 @@ const ENROLLMENTS_SHEET_NAME = 'Student_Enrollments';
 const ENROLLMENTS_ID_COLUMN = 1;       // A = EnrollmentID
 const ENROLLMENTS_FIRST_DATA_ROW = 2;
 
-// Columnas obligatorias base (según tu estructura):
-// B StudentID, C ProgramID, D DayOfWeek, E TimeSlot, F Periods, G AssignedProfessorID, H State
-const ENROLLMENTS_REQUIRED_BASE = [2, 3, 4, 5, 6, 7, 8];
+// Columnas obligatorias base (estructura actual A-Q):
+// B StudentID, D ProgramID, F DayOfWeek, G TimeSlot, H Periods, I AssignedProfessorID, K State
+// (C Student, E Program y J Assigned Professor son fórmulas/lookup: no se exigen)
+const ENROLLMENTS_REQUIRED_BASE = [2, 4, 6, 7, 8, 9, 11];
+const ENROLLMENTS_PERIODS_COLUMN = 8;  // H = Periods
+const ENROLLMENTS_STATE_COLUMN = 11;   // K = State
 
 /************************************
  * TRIGGER GENERADOR DE ID
@@ -37,11 +40,11 @@ function isEnrollmentRowReady(sheet, row) {
   }
 
   // Periods debe ser 1 o 2
-  const periods = sheet.getRange(row, 6).getValue(); // F
+  const periods = sheet.getRange(row, ENROLLMENTS_PERIODS_COLUMN).getValue(); // H
   if (!(periods === 1 || periods === 2)) return false;
 
   // State recomendado: Active / Inactive
-  const state = String(sheet.getRange(row, 8).getValue() || "").trim(); // H
+  const state = String(sheet.getRange(row, ENROLLMENTS_STATE_COLUMN).getValue() || "").trim(); // K
   if (state !== "Active" && state !== "Inactive") return false;
 
   return true;
@@ -49,31 +52,16 @@ function isEnrollmentRowReady(sheet, row) {
 
 /************************************
  * GENERAR ID AFM-EYYYYXXX
+ * Usa el MAYOR correlativo del año (igual que la migración automática,
+ * getLastEnrollmentSequence_), no el último de la hoja: si las filas
+ * están desordenadas, el último no es el mayor y se repetirían IDs.
  ************************************/
 function generateNextEnrollmentId(sheet) {
   const year = new Date().getFullYear();
   const prefix = "AFM-E";
   const seqDigits = 3;
 
-  const ids = sheet
-    .getRange(ENROLLMENTS_FIRST_DATA_ROW, ENROLLMENTS_ID_COLUMN, sheet.getLastRow() - ENROLLMENTS_FIRST_DATA_ROW + 1, 1)
-    .getValues()
-    .flat()
-    .filter(v => typeof v === "string" && v.startsWith(prefix));
-
-  let next = 1;
-
-  if (ids.length > 0) {
-    const lastId = ids[ids.length - 1];
-
-    // AFM-E2026001
-    const match = lastId.match(/^AFM-E(\d{4})(\d{3})$/);
-    if (match) {
-      const lastYear = Number(match[1]);
-      const lastSeq = Number(match[2]);
-      next = (lastYear === year) ? lastSeq + 1 : 1;
-    }
-  }
+  const next = getLastEnrollmentSequence_(sheet); // definido en schedule_form_response_migration.js
 
   return `${prefix}${year}${String(next).padStart(seqDigits, "0")}`;
 }

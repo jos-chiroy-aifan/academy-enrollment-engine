@@ -5,13 +5,18 @@
  * - Escribe el estado en la columna AB (Status) real.
  ************************************/
 
-function processStudentCreationOnly() {
+function processStudentCreationOnly(logger) {
+  // Usa el logger de la migración si viene; si se ejecuta sola (o desde un disparador), crea el suyo
+  const log = (logger && typeof logger.info === "function") ? logger : createRunLogger_("ALTA-ALUMNO");
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const rSheet = ss.getSheetByName("Student Registration - Responses");
   const sSheet = ss.getSheetByName("Students");
 
   const lastRow = rSheet.getLastRow();
-  if (lastRow < 2) return null;
+  if (lastRow < 2) {
+    log.warn("Alta de alumno: no hay filas de datos en 'Student Registration - Responses'.");
+    return null;
+  }
 
   // MAPEO EXACTO SEGÚN EL SCHEMA REAL (Base 1 para getRange, Base 0 para arrays)
   const COL = {
@@ -37,7 +42,10 @@ function processStudentCreationOnly() {
   const row = rSheet.getRange(lastRow, 1, 1, rSheet.getLastColumn()).getValues()[0];
 
   const currentStatus = String(row[COL.status - 1] || "").trim();
-  if (currentStatus === "Migrated" || currentStatus === "Approved") return null;
+  if (currentStatus === "Migrated" || currentStatus === "Approved") {
+    log.info(`Alta de alumno omitida: la fila ${lastRow} ya está "${currentStatus}".`);
+    return null;
+  }
 
   const firstName = String(row[COL.firstName - 1] || "").trim();
   const lastName = String(row[COL.lastName - 1] || "").trim();
@@ -47,7 +55,7 @@ function processStudentCreationOnly() {
   const existingStudent = findStudentByEmailAndName_(sSheet, email, firstName, lastName);
   if (existingStudent) {
     rSheet.getRange(lastRow, COL.status).setValue("Approved");
-    Logger.log(`ℹ️ Estudiante ya registrado previamente: ${existingStudent.id} (${existingStudent.fullName})`);
+    log.info(`Alta de alumno: ya existía en 'Students' -> ${existingStudent.id} (${existingStudent.fullName}). Estatus: "${currentStatus || "(vacío)"}" → "Approved"`);
     return existingStudent;
   }
 
@@ -83,12 +91,17 @@ function processStudentCreationOnly() {
   ];
 
   const sTargetRow = getFirstRealEmptyRow(sSheet, "A");
+  // 'Students' tiene filas plantilla (fórmula de edad y casillas) hasta abajo: escribir en ellas es normal.
+  // Solo se avisa si la fila destino tiene datos reales (B First Name, C Last Name, H Email).
+  if (sTargetRow <= sSheet.getLastRow() && rowHasData_(sSheet, sTargetRow, [2, 3, 8])) {
+    log.warn(`Alta de alumno: la fila ${sTargetRow} de 'Students' no tiene StudentID (columna A) pero SÍ tiene datos en nombre/correo. Se sobrescribirá. Revisa si era un alumno capturado a mano sin ID.`);
+  }
   sSheet.getRange(sTargetRow, 1, 1, studentRow.length).setValues([studentRow]);
   sSheet.getRange(sTargetRow, 5).setFormula(`=IF(D${sTargetRow}="","",DATEDIF(D${sTargetRow},TODAY(),"Y"))`);
 
   // Escribir en la columna AB (Status) real
   rSheet.getRange(lastRow, COL.status).setValue("Approved");
-  Logger.log(`✅ Estudiante nuevo creado: ${newStudentId} - ${firstName} ${lastName}`);
+  log.info(`✅ Alta de alumno: nuevo estudiante ${newStudentId} - ${firstName} ${lastName} en fila ${sTargetRow} de 'Students'. Estatus: "${currentStatus || "(vacío)"}" → "Approved"`);
 
   return {
     id: newStudentId,

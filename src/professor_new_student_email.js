@@ -24,7 +24,7 @@ function notifyProfessorNewStudent_(payload) {
   const prof = getProfessorContactById_(pSheet, payload.professorId);
   if (!prof || !prof.email) {
     Logger.log(`⚠️ Could not send email: ProfessorID ${payload.professorId} has no email or is not Active.`);
-    return;
+    return null;
   }
 
   const programName = getProgramNameById_(progSheet, payload.programId) || String(payload.programId || "").trim();
@@ -47,6 +47,9 @@ function notifyProfessorNewStudent_(payload) {
     htmlBody,
     name: ACADEMY_NAME
   });
+
+  // Devuelve el destinatario para que quien llama pueda registrarlo (null = no se envió)
+  return String(prof.email).trim();
 }
 
 /************************************
